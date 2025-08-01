@@ -1613,7 +1613,6 @@ class LLMJudgeProcessRewardWorker(Worker):
         
         # build device mesh for Ulysses Sequence Parallel
         world_size = torch.distributed.get_world_size()
-        # Note: self.world_size and self.rank are properties from the base Worker class
         from torch.distributed.device_mesh import init_device_mesh
 
         fsdp_size = self.config.model.fsdp_config.fsdp_size
@@ -1706,6 +1705,11 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
             print_model_size(judge_model)
 
         fsdp_config = self.config.model.fsdp_config
+        auto_wrap_policy = get_fsdp_wrap_policy(
+            module=judge_model, 
+            config=fsdp_config.get('wrap_policy', None),
+        )
+
 
 
         sharding_strategy = get_sharding_strategy(self.device_mesh)
@@ -1714,7 +1718,7 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
             judge_model,
             param_init_fn=init_fn,
             use_orig_params=False,
-            auto_wrap_policy=None,  # HFrollout
+            auto_wrap_policy=auto_wrap_policy, 
             device_id=torch.cuda.current_device(),
             sharding_strategy=sharding_strategy,
             sync_module_states=True,
@@ -1724,6 +1728,27 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
         )
 
         log_gpu_memory_usage('After Judge LLM FSDP', logger=None)
+        if self.config.training:
+            prm_optimizer = optim.AdamW(
+                judge_model.parameters(),
+                lr=config.optim.lr,
+                betas=config.optim.get('betas', (0.9, 0.999)),
+                weight_decay=config.optim.get('weight_decay', 1e-2),
+            )
+
+            total_steps = config.optim.get('total_training_steps', 0)
+            num_warmup_steps_ratio = config.optim.get('lr_warmup_steps_ratio', 0.)
+            num_warmup_steps = int(num_warmup_steps_ratio * total_steps)
+
+            print(f'Total steps: {total_steps}, num_warmup_steps: {num_warmup_steps}')
+
+            from verl.utils.torch_functional import get_constant_schedule_with_warmup
+            prm_lr_scheduler = get_constant_schedule_with_warmup(
+                optimizer=prm_optimizer,
+                num_warmup_steps=num_warmup_steps,
+            )
+
+            return judge_model, prm_optimizer, prm_lr_scheduler
         return judge_model
 
     def _init_separator(self, config):
@@ -1751,19 +1776,24 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
     def init_model(self):
         """Initialize the judge model"""
         import_external_libs(self.config.model.get('external_lib', None))
+        results = self._build_judge_model(self.config)
+        if self.config.training:
+            self.judge_model, self.judge_optimizer, self.judge_lr_scheduler = results
+        else:
+            self.judge_model = results
         
-        self.judge_model = self._build_judge_model(self.config)
-
-        from verl.workers.rollout import HFRollout
-        from verl.workers.sharding_manager import BaseShardingManager
-        self.rollout = HFRollout(module=self.judge_model, config=self.config.rollout)
-        self.rollout_sharding_manager = BaseShardingManager()
-
-
         self._init_separator(self.config)
 
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.judge_model)
+        if self.config.training and self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.judge_optimizer)
+
+        if self.config.training:
+            # initialize:
+            # DataParallel: forward, loss, backward, optim.step
+            # CheckpointManager: save, load ckpt
+            raise NotImplementedError
 
         torch.cuda.empty_cache()
 
@@ -1853,9 +1883,17 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
         # Default score if parsing fails
         return 0.5
 
+    def _extract_content_value(self, text):
+        pattern = r"'content':\s*'(.*?)',\s*'role'"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1)
+        return None
+
     def _llm_judge_step(self, problem_text, previous_steps_text, current_step_text):
         """Use LLM to judge a single reasoning step"""
-
+        problem_text = self._extract_content_value(problem_text)
+        
         # Format the prompt
         prompt = self.judge_prompt_template.format(
             problem=problem_text,
@@ -1878,15 +1916,12 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
             truncation=True,
             max_length=self.config.get('max_judge_input_length', 2048)
         )
-        # import pdb;pdb.set_trace()
-        prompts = DataProto.from_single_dict({
-            "input_ids": inputs['input_ids'],
-            "attention_mask": inputs['attention_mask'],
-            "position_ids": inputs.get('position_ids', None) if 'position_ids' in inputs else None,
-            "raw_prompts": messages, 
-        }
-             
-        )
+        
+        # prompts = DataProto.from_dict({
+        #     "input_ids": inputs['input_ids'],
+        #     "attention_mask": inputs['attention_mask'],
+        #     "position_ids": compute_position_id_with_mask(inputs['attention_mask'])
+        # })
         
         # # 确保所有输入张量都在GPU上
         # for key in inputs:
@@ -1895,50 +1930,58 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
 
         # 确保模型参数已经正确加载到GPU - 关键修复
 
-        # if self._is_offload_param:
-        #     # 如果模型被offload，确保它被正确加载到GPU
-        #     load_fsdp_model_to_gpu(self.judge_model)
+        if self._is_offload_param:
+            # 如果模型被offload，确保它被正确加载到GPU
+            load_fsdp_model_to_gpu(self.judge_model)
         
-        # # 确保模型在评估模式
-        # self.judge_model.eval()
-        with self.rollout_sharding_manager:
+        # 确保模型在评估模式
+        self.judge_model.eval()
+ 
 
-            # after parameters sync with rollout, offload actor model to CPU
-            if self._is_offload_param:
-                offload_fsdp_model_to_cpu(self.judge_model)
+        # Generate response
+        with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            input_ids = inputs['input_ids']
+            batch, seqlen = input_ids.shape
+            attention_mask = inputs['attention_mask']
+            position_ids = compute_position_id_with_mask(inputs['attention_mask'])
 
-            log_gpu_memory_usage('After entering PRM rollout sharding manager', logger=logger)
+            if self.use_remove_padding:
+                input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1),
+                                                           attention_mask)  # input_ids_rmpad (total_nnz, ...)
+                input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            import pdb;pdb.set_trace()
+                # unpad the position_ids to align the rotary
+                position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                                      indices).transpose(0, 1)
+
+                # pad and slice the inputs if sp > 1
+                if self.ulysses_sequence_parallel_size > 1:
+                    input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
+                        input_ids_rmpad,
+                        position_ids_rmpad,
+                        sp_size=self.ulysses_sequence_parallel_size,
+                    )
+
+
+                import pdb;pdb.set_trace()
+                output = self.judge_model(
+                    input_ids=input_ids_rmpad,
+                    attention_mask=None,
+                    position_ids=position_ids_rmpad,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+            else:
+                output = self.judge_model(input_ids=input_ids,
+                                                    attention_mask=attention_mask,
+                                                    position_ids=position_ids)
         
-            output = self.rollout.generate_sequences(prompts=prompts)
-
-            log_gpu_memory_usage('After rollout generation', logger=logger)
-
-            output = self.rollout_sharding_manager.postprocess_data(output)
-
-        # # Generate response
-        # with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        #     import pdb;pdb.set_trace()
-        #     outputs = self.judge_model.generate(
-        #         **inputs,
-        #         max_new_tokens=self.config.get('max_judge_output_length', 50),
-        #         temperature=0.1,  # Low temperature for consistent scoring
-        #         do_sample=True,
-        #         pad_token_id=self.tokenizer.pad_token_id,
-        #         eos_token_id=self.tokenizer.eos_token_id,
-        #         # synced_gpus=False,  # 关键修复：禁用GPU同步，避免分布式通信问题
-        #         use_cache=True,
-        #     )
-        
-        # # Decode response
-        # response_ids = outputs[0][inputs['input_ids'].shape[1]:]
-        # response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-        
-        # Extract score
-        score = self._extract_score_from_response(response_text)
-        return score
+            # Decode response
+            response_ids = outputs[0][inputs['input_ids'].shape[1]:]
+            response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            
+            # Extract score
+            score = self._extract_score_from_response(response_text)
+            return score
 
     def _judge_all_steps(self, data):
         """Judge all steps for all samples in the batch"""
@@ -2450,29 +2493,8 @@ class AsyncRemoteLLMJudgeWorker(Worker):
         # Judge prompt template
         self.judge_prompt_template = config.llm_as_judge_api.get('judge_prompt_template', None)
         if self.judge_prompt_template is None:
-            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.
-
-[Problem]
-{problem}
-
-[Previous steps]
-{previous_steps}
-
-[Current step being evaluated]
-{current_step}
-
-Please rate this step on a scale from 0 to 1, where:
-- 0: Completely incorrect or harmful to the solution
-- 1: Perfectly correct and helpful for solving the problem
-
-Consider:
-- Mathematical accuracy
-- Logical consistency with previous steps
-- Progress towards the solution
-
-Please provide a brief analysis (about 100 words) and give your score.
-Please provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.875}}"""
-
+            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.\n\n[Problem]{problem}\n\n[Previous steps]{previous_steps}\n\n[Current step being evaluated]{current_step}\n\nPlease rate this step on a scale from 0 to 1, where:\n - 0: Completely incorrect or harmful to the solution\n- 1: Perfectly correct and helpful for solving the problem\n\nConsider:\n- Mathematical accuracy(20\% score)\n- Logical consistency with previous steps(50\% score)\n- Progress towards the solution(30\% score)\n\nPlease provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.875}}"""
+        
         # Step separation configuration
         self.split_step_char = config.llm_as_judge_api.get('split_step_char', '\n\n')
         self.step_separator = config.llm_as_judge_api.get('step_separator', '\n')
