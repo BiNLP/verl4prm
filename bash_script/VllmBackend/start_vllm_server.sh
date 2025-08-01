@@ -23,7 +23,7 @@ print_info "模型路径: $MODEL_PATH"
 print_info "服务地址: http://${VLLM_HOST}:${VLLM_PORT}"
 
 
-python /data/home/scyb224/Workspace/PURE/bash_script/VllmBackend/start_vllm_server.py \
+python /data/home/scyb224/Workspace/verl4prm/bash_script/VllmBackend/start_vllm_server.py \
     --model "$MODEL_PATH" \
     --host "$VLLM_HOST" \
     --port "$VLLM_PORT" \

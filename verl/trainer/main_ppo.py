@@ -133,7 +133,9 @@ def main_task(config, compute_score=None):
         elif config.reward_model.type == "judge":
             if config.reward_model.strategy == 'fsdp':
                 from verl.workers.fsdp_workers import (
-                    RemoteLLMJudgeWorker as RewardModelWorker
+                    # LLMJudgeProcessRewardWorker as RewardModelWorker
+                    # RemoteLLMJudgeWorker as RewardModelWorker
+                    AsyncRemoteLLMJudgeWorker as RewardModelWorker
                 )
             elif config.reward_model.strategy == 'megatron':
                 raise NotImplementedError

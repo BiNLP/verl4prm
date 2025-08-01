@@ -154,7 +154,7 @@ reward_model:
   llm_as_judge_api:
     api_base_url: "http://127.0.0.1:8000"
     model_name: "judge-model"
-    max_judge_output_length: 1024
+    max_judge_output_length: 512
     temperature: 0.1
     request_timeout: 30
     max_retries: 3

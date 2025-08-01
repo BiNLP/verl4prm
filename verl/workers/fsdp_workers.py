@@ -48,6 +48,9 @@ from verl.utils.model import compute_position_id_with_mask
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
 
 import re
+import asyncio
+import aiohttp
+import time
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -2086,27 +2089,7 @@ class RemoteLLMJudgeWorker(Worker):
         # Judge prompt template
         self.judge_prompt_template = config.llm_as_judge_api.get('judge_prompt_template', None)
         if self.judge_prompt_template is None:
-            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.
-
-[Problem]
-{problem}
-
-[Previous steps]
-{previous_steps}
-
-[Current step being evaluated]
-{current_step}
-
-Please rate this step on a scale from 0 to 1, where:
-- 0: Completely incorrect or harmful to the solution
-- 1: Perfectly correct and helpful for solving the problem
-
-Consider:
-- Mathematical accuracy
-- Logical consistency with previous steps
-- Progress towards the solution
-
-Please provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.87543}}"""
+            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.\n\n[Problem]{problem}\n\n[Previous steps]{previous_steps}\n\n[Current step being evaluated]{current_step}\n\nPlease rate this step on a scale from 0 to 1, where:\n - 0: Completely incorrect or harmful to the solution\n- 1: Perfectly correct and helpful for solving the problem\n\nConsider:\n- Mathematical accuracy(20\% score)\n- Logical consistency with previous steps(50\% score)\n- Progress towards the solution(30\% score)\n\nPlease provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.875}}"""
 
         # Step separation configuration
         self.split_step_char = config.llm_as_judge_api.get('split_step_char', '\n\n')
@@ -2429,6 +2412,396 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
         """Clean up resources"""
         if hasattr(self, 'session'):
             self.session.close()
+
+
+class AsyncRemoteLLMJudgeWorker(Worker):
+    """
+    异步并发版本的 Remote LLM-as-a-Judge Process Reward Worker
+    使用 aiohttp 和 asyncio.gather 实现并发API调用，大幅提升性能
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl")
+        
+        self.config = config
+        
+        # Remote inference configuration  
+        self.api_base_url = config.llm_as_judge_api.get('api_base_url', 'http://127.0.0.1:8000')
+        self.model_name = config.llm_as_judge_api.get('model_name', 'judge-model')
+        self.max_judge_output_length = config.llm_as_judge_api.get('max_judge_output_length', 100)
+        self.temperature = config.llm_as_judge_api.get('temperature', 0.6)
+        self.request_timeout = config.llm_as_judge_api.get('request_timeout', 30)
+        self.max_retries = config.llm_as_judge_api.get('max_retries', 3)
+        self.retry_delay = config.llm_as_judge_api.get('retry_delay', 1.0)
+
+        # 采样参数
+        self.top_p = config.llm_as_judge_api.get('top_p', 0.9)
+        self.top_k = config.llm_as_judge_api.get('top_k', 50)
+        self.min_p = config.llm_as_judge_api.get('min_p', 0.01)
+        self.repetition_penalty = config.llm_as_judge_api.get('repetition_penalty', 1.0)
+        self.frequency_penalty = config.llm_as_judge_api.get('frequency_penalty', 0.0)
+        self.length_penalty = config.llm_as_judge_api.get('length_penalty', 1.0)
+        
+        # 并发控制参数
+        self.max_concurrent_requests = config.llm_as_judge_api.get('max_concurrent_requests', 10)
+        
+        # Judge prompt template
+        self.judge_prompt_template = config.llm_as_judge_api.get('judge_prompt_template', None)
+        if self.judge_prompt_template is None:
+            self.judge_prompt_template = """Please evaluate the quality of the following reasoning step in solving the problem.
+
+[Problem]
+{problem}
+
+[Previous steps]
+{previous_steps}
+
+[Current step being evaluated]
+{current_step}
+
+Please rate this step on a scale from 0 to 1, where:
+- 0: Completely incorrect or harmful to the solution
+- 1: Perfectly correct and helpful for solving the problem
+
+Consider:
+- Mathematical accuracy
+- Logical consistency with previous steps
+- Progress towards the solution
+
+Please provide a brief analysis (about 100 words) and give your score.
+Please provide your evaluation and place your final score in \\boxed{{}} format. For example: \\boxed{{0.875}}"""
+
+        # Step separation configuration
+        self.split_step_char = config.llm_as_judge_api.get('split_step_char', '\n\n')
+        self.step_separator = config.llm_as_judge_api.get('step_separator', '\n')
+        
+        # Credit assignment configuration
+        self.disable_approx_min_form_credit_assignment = config.get('disable_approx_min_form_credit_assignment', False)
+        self.credit_assignment_temperature = config.get('credit_assignment_temperature', 1.0)
+        
+        # Initialize tokenizer for text processing
+        self._init_tokenizer()
+
+    def _init_tokenizer(self):
+        """Initialize tokenizer for text processing"""
+        from verl.utils import hf_tokenizer
+        from verl.utils.fs import copy_to_local
+        
+        # Use a simple tokenizer for text processing
+        tokenizer_path = self.config.llm_as_judge_api.get('tokenizer_path', "Qwen/Qwen2.5-1.5B-Instruct")
+        trust_remote_code = self.config.llm_as_judge_api.get('trust_remote_code', True)
+        
+        if os.path.exists(tokenizer_path):
+            local_path = copy_to_local(tokenizer_path)
+        else:
+            local_path = tokenizer_path  # Assume it's a model name from HF hub
+            
+        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        self.eos_token = self.tokenizer.decode(self.tokenizer.eos_token_id, skip_special_tokens=False)
+        
+        # Initialize step separator tokens for splitting
+        self.split_step_tokens = []
+        for i in range(len(self.tokenizer)):
+            if self.tokenizer.decode(i).endswith(self.split_step_char):
+                self.split_step_tokens.append(i)
+        self.split_step_tokens = torch.LongTensor(self.split_step_tokens)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def init_model(self):
+        """Initialize the remote connection (no local model needed)"""
+        # Test connection to remote server
+        self._test_connection()
+        
+        # Initialize separator tokens on GPU if needed
+        if torch.cuda.is_available():
+            self.split_step_tokens = self.split_step_tokens.cuda()
+
+    def _test_connection(self):
+        """Test connection to remote API server"""
+        import requests
+        
+        try:
+            session = requests.Session()
+            health_url = f"{self.api_base_url}/health"
+            response = session.get(health_url, timeout=5)
+            
+            if response.status_code == 200:
+                logger.info(f"Successfully connected to remote LLM server at {self.api_base_url}")
+                print(f"Successfully connected to remote LLM server at {self.api_base_url}")
+            else:
+                logger.warning(f"Remote server returned status {response.status_code}")
+                
+        except requests.RequestException as e:
+            logger.error(f"Failed to connect to remote LLM server: {e}")
+            raise RuntimeError(f"Cannot connect to remote LLM server at {self.api_base_url}")
+        finally:
+            session.close()
+
+    def _split_steps(self, data):
+        """Split responses into reasoning steps (same as original implementation)"""
+        bs, problem_length = data.batch['prompts'].size()
+        action_mask = data.batch['attention_mask'][:, problem_length:]
+        num_actions = action_mask.size(1)
+        solution_tokens = data.batch['responses']
+
+        # Find step separator, typically '\n\n'
+        row_ids, column_ids = torch.where(
+            torch.isin(solution_tokens, self.split_step_tokens)
+        )
+        
+        # +1 for the last step with eos instead of step separator
+        max_num_steps = max([column_ids[row_ids==i].numel() for i in range(bs)]) + 1
+        
+        # End index of each step, shape: (B, max_num_steps), type: long
+        score_ids = torch.full(
+            (bs, max_num_steps), -1, dtype=torch.long, 
+            device=solution_tokens.device,
+        )
+        
+        # Whether end of step, shape: (B, max_response_tokens), type: bool
+        reward_mask = torch.zeros_like(solution_tokens, dtype=torch.bool)
+        eos_indices = num_actions - 1 - action_mask.long().fliplr().argmax(1)
+        
+        for j in range(bs):
+            step_separators_per_data = column_ids[row_ids==j]
+            num_intermediate_steps = step_separators_per_data.numel()
+            # Intermediate steps
+            score_ids[j, :num_intermediate_steps] = step_separators_per_data
+            reward_mask[j, step_separators_per_data] = True
+            # Last step
+            score_ids[j, num_intermediate_steps] = eos_indices[j]
+            reward_mask[j, eos_indices[j]] = True
+        
+        score_mask = score_ids != -1
+        output = dict(
+            score_ids=score_ids,
+            score_mask=score_mask,
+            reward_mask=reward_mask,
+            num_steps=score_mask.float().sum(dim=-1),
+        )
+        return DataProto.from_dict(tensors=output)
+
+    def _extract_score_from_response(self, response_text):
+        """Extract numerical score from LLM judge response (same as original)"""
+        
+        # First try to extract from \boxed{} format
+        boxed_pattern = r'\\boxed\{([^}]+)\}'
+        boxed_matches = re.findall(boxed_pattern, response_text)
+        
+        if boxed_matches:
+            try:
+                boxed_content = boxed_matches[-1].strip()
+                score = float(boxed_content)
+                return max(0.0, min(1.0, score))
+            except ValueError:
+                pass
+        
+        # Fallback: Try to extract a decimal number between 0 and 1
+        # decimal_pattern = r'\b(0\.\d+|1\.0)\b'
+        # decimal_matches = re.findall(decimal_pattern, response_text)
+        
+        # if decimal_matches:
+        #     try:
+        #         score = float(decimal_matches[-1])
+        #         return max(0.0, min(1.0, score))
+        #     except ValueError:
+        #         pass
+        
+        # Default score if parsing fails
+        return 0.01
+
+    def _extract_content_value(self, text):
+        """Extract content from chat template format"""
+        pattern = r"'content':\s*'(.*?)',\s*'role'"
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1)
+        return None
+
+    async def _async_llm_judge_step(self, session, semaphore, problem_text, previous_steps_text, current_step_text):
+        """Use remote LLM API to judge a single reasoning step asynchronously"""
+        
+        async with semaphore:  # Control concurrent requests
+            problem_text_advance = self._extract_content_value(problem_text)
+            if problem_text_advance is None:
+                problem_text_advance = problem_text
+            
+            # Format the prompt
+            prompt = self.judge_prompt_template.format(
+                problem=problem_text,
+                previous_steps=previous_steps_text,
+                current_step=current_step_text
+            )
+            
+            # Prepare API request
+            messages = [{'role': 'user', 'content': prompt}]
+            
+            payload = {
+                "model": self.model_name,
+                "messages": messages,
+                "max_tokens": self.max_judge_output_length,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "min_p": self.min_p,
+                "top_k": self.top_k,
+                "repetition_penalty": self.repetition_penalty,
+                "frequency_penalty": self.frequency_penalty,
+                "length_penalty": self.length_penalty,
+                "stop": ["\\n\\n", self.eos_token],
+                "stream": False,
+            }
+
+            # Retry logic for robust API calls
+            for attempt in range(self.max_retries):
+                try:
+                    start_time = time.time()
+                    
+                    async with session.post(
+                        f"{self.api_base_url}/v1/chat/completions",
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=self.request_timeout)
+                    ) as response:
+                        
+                        end_time = time.time()
+                        
+                        if response.status == 200:
+                            result = await response.json()
+                            response_text = result["choices"][0]["message"]["content"]
+                            
+                            # Extract and return score
+                            score = self._extract_score_from_response(response_text)
+                            print(f"[LLM-as-a-Judge score] {score}")
+
+                            if self.rank == 0 and attempt == 0:  # Log only on first successful attempt and rank 0
+                                logger.debug(f"Async judge response time: {end_time - start_time:.3f}s")
+                            
+                            return score
+                        
+                        else:
+                            error_text = await response.text()
+                            logger.warning(f"API request failed with status {response.status}: {error_text}")
+                            
+                except Exception as e:
+                    logger.warning(f"API request attempt {attempt + 1} failed: {e}")
+                    
+                    if attempt < self.max_retries - 1:
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))  # Exponential backoff
+                        
+            # If all retries failed, return default score
+            logger.error(f"All {self.max_retries} API request attempts failed, returning default score")
+            return 0.01
+
+    async def _async_judge_all_steps(self, data):
+        """Judge all steps for all samples in the batch using async concurrent API calls"""
+        bs = data.batch['prompts'].size(0)
+        solution_tokens = data.batch['responses']
+        score_ids = data.batch['score_ids']
+        score_mask = data.batch['score_mask']
+        reward_mask = data.batch['reward_mask']
+        
+        # Prepare all tasks for concurrent execution
+        tasks = []
+        task_positions = []
+        
+        # Create connection pool
+        connector = aiohttp.TCPConnector(
+            limit=self.max_concurrent_requests * 2,  # Total connection pool size
+            limit_per_host=self.max_concurrent_requests,  # Connections per host
+            keepalive_timeout=60,  # Keep connections alive for reuse
+            enable_cleanup_closed=True
+        )
+        
+        # Create semaphore to control concurrent requests
+        semaphore = asyncio.Semaphore(self.max_concurrent_requests)
+        
+        # Create timeout for the session
+        timeout = aiohttp.ClientTimeout(total=self.request_timeout * 2)  # Total timeout for session
+        
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            for batch_idx in range(bs):
+                # Extract problem text
+                problem_ids = data.batch['prompts'][batch_idx]
+                problem_mask = data.batch['attention_mask'][batch_idx][:len(problem_ids)]
+                valid_problem_ids = problem_ids[problem_mask.bool()]
+                problem_text = self.tokenizer.decode(valid_problem_ids, skip_special_tokens=True)
+                
+                # Process each step
+                previous_steps_text = ""
+                valid_scores = score_ids[batch_idx][score_mask[batch_idx]]
+                
+                for step_idx, step_end_pos in enumerate(valid_scores):
+                    # Extract current step
+                    if step_idx == 0:
+                        start_pos = 0
+                    else:
+                        start_pos = valid_scores[step_idx - 1] + 1
+                    
+                    current_step_ids = solution_tokens[batch_idx, start_pos:step_end_pos]
+                    current_step_text = self.tokenizer.decode(current_step_ids, skip_special_tokens=True)
+                    
+                    # Create async task for judging this step
+                    task = self._async_llm_judge_step(
+                        session, semaphore, problem_text, previous_steps_text, current_step_text
+                    )
+                    tasks.append(task)
+                    task_positions.append((batch_idx, step_end_pos))
+                    
+                    # Update previous steps for next iteration
+                    if previous_steps_text:
+                        previous_steps_text += "\n" + current_step_text
+                    else:
+                        previous_steps_text = current_step_text
+            
+            # Execute all tasks concurrently
+            start_time = time.time()
+            scores = await asyncio.gather(*tasks, return_exceptions=True)
+            end_time = time.time()
+            
+            if self.rank == 0:
+                logger.info(f"Processing {len(tasks)} tasks took {end_time - start_time:.2f} seconds")
+        
+        # Initialize scores tensor
+        step_scores = torch.zeros_like(reward_mask, dtype=torch.float32, device=reward_mask.device)
+        
+        # Assign scores to their positions
+        for (batch_idx, step_end_pos), score in zip(task_positions, scores):
+            if isinstance(score, Exception):
+                logger.error(f"Task failed: {score}")
+                score = 0.0  # Fallback score
+            step_scores[batch_idx, step_end_pos] = score
+            logger.info(f"###### Step {step_end_pos} for batch {batch_idx} scored: {score} ######")
+        
+        return step_scores
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def compute_rm_score(self, data: DataProto):
+        """Main method to compute process rewards using async remote LLM judge"""
+        data = data.to('cuda')
+        
+        # Split data into steps
+        data.union(self._split_steps(data))
+        
+        # Judge all steps for all samples using async concurrency
+        token_level_scores = asyncio.run(self._async_judge_all_steps(data))
+        
+        # Apply credit assignment if configured
+        if not self.disable_approx_min_form_credit_assignment:
+            reward_mask = data.batch['reward_mask']
+            weight = torch.softmax(
+                -token_level_scores.masked_fill(
+                    ~reward_mask, float('inf')
+                ) / self.credit_assignment_temperature,
+                dim=-1,
+            )
+            token_level_scores *= weight
+
+        output = DataProto.from_dict(tensors={'rm_scores': token_level_scores})
+        output = output.to('cpu')
+        
+        return output
+
 
 """ 
 Warning: The following resource request cannot be scheduled right now: {'CPU': 1.0, 'GPU': 2.0}. This is likely due to all cluster resources being claimed by actors. Consider creating fewer actors or adding more nodes to this Ray cluster.
