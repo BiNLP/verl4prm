@@ -51,6 +51,13 @@ import re
 import asyncio
 import aiohttp
 import time
+from flash_attn.bert_padding import (
+    index_first_axis,
+    pad_input,
+    rearrange,
+    unpad_input,
+)
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv('VERL_PPO_LOGGING_LEVEL', 'WARN'))
@@ -1724,8 +1731,10 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
             sync_module_states=True,
             forward_prefetch=False,
             device_mesh=self.device_mesh,
-            cpu_offload=CPUOffload(offload_params=True),
+            cpu_offload=CPUOffload(offload_params=False),
         )
+
+        load_fsdp_model_to_gpu(judge_model)
 
         log_gpu_memory_usage('After Judge LLM FSDP', logger=None)
         if self.config.training:
@@ -1937,7 +1946,7 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
         # 确保模型在评估模式
         self.judge_model.eval()
  
-
+        
         # Generate response
         with torch.no_grad(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             input_ids = inputs['input_ids']
@@ -1963,22 +1972,26 @@ Please provide your evaluation and place your final score in \\boxed{{}} format.
                     )
 
 
-                import pdb;pdb.set_trace()
-                output = self.judge_model(
-                    input_ids=input_ids_rmpad,
-                    attention_mask=None,
-                    position_ids=position_ids_rmpad,
+                
+                output = self.judge_model.generate(
+                    input_ids=input_ids.cuda(),
+                    attention_mask=attention_mask.cuda(),
+                    position_ids=position_ids.cuda(),
                     use_cache=False,
                 )  # prevent model thinks we are generating
+                # output = self.judge_model.generate(input_ids=input_ids,
+                #                                     attention_mask=attention_mask,
+                #                                     position_ids=position_ids)
+
             else:
-                output = self.judge_model(input_ids=input_ids,
+                output = self.judge_model.generate(input_ids=input_ids,
                                                     attention_mask=attention_mask,
                                                     position_ids=position_ids)
         
             # Decode response
-            response_ids = outputs[0][inputs['input_ids'].shape[1]:]
+            response_ids = output[0][inputs['input_ids'].shape[1]:]
             response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-            
+            import pdb;pdb.set_trace() 
             # Extract score
             score = self._extract_score_from_response(response_text)
             return score
