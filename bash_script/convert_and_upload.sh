@@ -1,0 +1,20 @@
+
+checkpoint_dir="/data/home/scyb224/Workspace/verl/checkpoints/verl/Qwen2.5-1.5B_GRPO_LogiQA2K_epoch10/global_step_150/actor"
+
+
+output_dir="/data/home/scyb224/Workspace/verl/output_models/Qwen2.5-1.5B_GRPO_LogiQA2K_epoch10"
+
+# python /home/chenzhb/Workspaces/verl/scripts/model_merger.py \
+#     --backend "fsdp" \
+#     --hf_upload_path 'BunnyNLP/Qwen2.5-1.5B-GRPO-Math220K' \
+#     --hf_model_path ${checkpoint_dir} \
+#     --local_dir ${checkpoint_dir} \
+#     --target_dir ${output_dir} 
+
+
+# 不上传 hf
+python /data/home/scyb224/Workspace/verl/scripts/model_merger.py \
+    --backend "fsdp" \
+    --hf_model_path ${checkpoint_dir} \
+    --local_dir ${checkpoint_dir} \
+    --target_dir ${output_dir} 
